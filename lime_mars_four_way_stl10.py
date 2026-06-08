@@ -4,10 +4,10 @@ This script intentionally keeps the experiment small and fixed: one image, one
 segmentation, one sample count, one Gaussian-noise level, and one target class.
 It compares exactly four explanation settings:
 
-1. Standard LIME with Ridge surrogate.
-2. Standard LIME-style perturbations with a MARS (py-earth Earth) surrogate.
-3. Gaussian-noise LIME-style perturbations with a MARS surrogate.
-4. Gaussian-noise LIME-style perturbations with a Ridge surrogate.
+1. Standard LIME.
+2. Standard LIME + MARS surrogate.
+3. Gaussian-noise LIME.
+4. Gaussian-noise LIME + MARS surrogate.
 
 The MARS usage follows the user's provided LEMON/HF-LIME code pattern: use
 ``pyearth.Earth`` as the local surrogate, then convert basis-function outputs
@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from lime import lime_image
 from matplotlib.patches import Patch
 from pyearth import Earth
-from skimage.segmentation import slic
+from skimage.segmentation import mark_boundaries, slic
 from sklearn.linear_model import Ridge
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -337,12 +337,14 @@ def run_custom_explanation(
     }
 
 
-def standard_lime_ridge(
+def standard_lime(
     image: np.ndarray,
     predict_fn,
     target_class: int,
     num_samples: int,
+    num_features: int,
 ):
+    """Run the regular, everyday image LIME baseline and keep its usual display."""
     explainer = lime_image.LimeImageExplainer(random_state=42)
     explanation = explainer.explain_instance(
         image,
@@ -358,17 +360,45 @@ def standard_lime_ridge(
     for segment_id, weight in local_exp.items():
         if 0 <= segment_id < len(segment_weights):
             segment_weights[segment_id] = weight
+
+    temp, mask = explanation.get_image_and_mask(
+        target_class,
+        positive_only=True,
+        num_features=num_features,
+        hide_rest=False,
+    )
+    temp = np.asarray(temp)
+    if temp.max() > 1.0:
+        temp = temp / 255.0
+    display_image = mark_boundaries(temp, mask, color=(0, 1, 0), mode="inner")
+
     return {
         "segments": segments,
         "segment_weights": segment_weights,
+        "display_image": display_image,
         "score": explanation.score,
         "target_class": target_class,
         "perturbation": "standard",
-        "surrogate_type": "lime_default_ridge",
+        "surrogate_type": "lime_default",
     }
 
 
-def build_signed_maps(segments: np.ndarray, segment_weights: np.ndarray):
+def top_feature_weights(segment_weights: np.ndarray, num_features: int) -> np.ndarray:
+    """Keep only the strongest superpixels so plots look like normal LIME outputs."""
+    filtered = np.zeros_like(segment_weights, dtype=float)
+    if num_features <= 0 or len(segment_weights) == 0:
+        return filtered
+    top_idx = np.argsort(np.abs(segment_weights))[-num_features:]
+    filtered[top_idx] = segment_weights[top_idx]
+    return filtered
+
+
+def build_signed_maps(
+    segments: np.ndarray,
+    segment_weights: np.ndarray,
+    num_features: int,
+):
+    segment_weights = top_feature_weights(segment_weights, num_features)
     positive_map = np.zeros(segments.shape, dtype=np.float32)
     negative_map = np.zeros(segments.shape, dtype=np.float32)
     for i, seg_val in enumerate(np.unique(segments)):
@@ -384,15 +414,27 @@ def build_signed_maps(segments: np.ndarray, segment_weights: np.ndarray):
     return positive_map, negative_map
 
 
-def plot_four_way(image: np.ndarray, results: list[dict], output_path: Path) -> None:
+def plot_four_way(
+    image: np.ndarray,
+    results: list[dict],
+    output_path: Path,
+    num_features: int,
+) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 11))
     axes = axes.flatten()
     for ax, result in zip(axes, results):
-        pos_map, neg_map = build_signed_maps(result["segments"], result["segment_weights"])
-        ax.imshow(image)
-        ax.imshow(pos_map, cmap="Greens", alpha=0.55)
-        ax.imshow(neg_map, cmap="Reds", alpha=0.55)
-        ax.set_title(f"{result['name']}\nscore={result['score']:.3f}")
+        if "display_image" in result:
+            ax.imshow(result["display_image"])
+        else:
+            pos_map, neg_map = build_signed_maps(
+                result["segments"],
+                result["segment_weights"],
+                num_features=num_features,
+            )
+            ax.imshow(image)
+            ax.imshow(pos_map, cmap="Greens", alpha=0.55)
+            ax.imshow(neg_map, cmap="Reds", alpha=0.55)
+        ax.set_title(result["name"])
         ax.axis("off")
 
     legend_handles = [
@@ -412,6 +454,7 @@ def parse_args():
     parser.add_argument("--checkpoint", default="stl10_best_model.pt")
     parser.add_argument("--output", default="outputs/lime_mars_four_way.png")
     parser.add_argument("--num-samples", type=int, default=1000)
+    parser.add_argument("--num-features", type=int, default=12)
     parser.add_argument("--sigma-noise", type=float, default=35.0)
     parser.add_argument("--desired-label", type=int, default=8, help="Default: ship")
     parser.add_argument("--seed", type=int, default=42)
@@ -437,8 +480,14 @@ def main() -> None:
     kernel_width = default_kernel_width(len(np.unique(segments)))
 
     results = []
-    result = standard_lime_ridge(image, predict_fn, target_class, args.num_samples)
-    result["name"] = "1. Standard LIME (Ridge)"
+    result = standard_lime(
+        image,
+        predict_fn,
+        target_class,
+        args.num_samples,
+        args.num_features,
+    )
+    result["name"] = "1. Standard LIME"
     results.append(result)
 
     result = run_custom_explanation(
@@ -463,10 +512,10 @@ def main() -> None:
         args.num_samples,
         kernel_width,
         perturbation="gaussian",
-        surrogate_type="mars",
+        surrogate_type="ridge",
         sigma_noise=args.sigma_noise,
     )
-    result["name"] = "3. Gaussian-noise LIME + MARS"
+    result["name"] = "3. Gaussian-noise LIME"
     results.append(result)
 
     result = run_custom_explanation(
@@ -477,20 +526,21 @@ def main() -> None:
         args.num_samples,
         kernel_width,
         perturbation="gaussian",
-        surrogate_type="ridge",
+        surrogate_type="mars",
         sigma_noise=args.sigma_noise,
     )
-    result["name"] = "4. Gaussian-noise LIME (Ridge)"
+    result["name"] = "4. Gaussian-noise LIME + MARS"
     results.append(result)
 
     output_path = Path(args.output)
-    plot_four_way(image, results, output_path)
+    plot_four_way(image, results, output_path, num_features=args.num_features)
 
     print(f"Example index: {example_idx}")
     print(f"True class: {CLASS_NAMES[true_label]}")
     print(f"Target/predicted class: {CLASS_NAMES[target_class]} ({probs[target_class]:.4f})")
     print(f"Segments: {len(np.unique(segments))}")
     print(f"Samples per method: {args.num_samples}")
+    print(f"Displayed superpixels per method: {args.num_features}")
     print(f"Kernel width: {kernel_width:.3f}")
     print(f"Gaussian sigma: {args.sigma_noise}")
     for result in results:
