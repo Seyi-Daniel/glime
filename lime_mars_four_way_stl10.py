@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from lime import lime_image
 from matplotlib.patches import Patch
 from pyearth import Earth
-from skimage.segmentation import mark_boundaries, slic
+from skimage.segmentation import slic
 from sklearn.linear_model import Ridge
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -342,9 +342,8 @@ def standard_lime(
     predict_fn,
     target_class: int,
     num_samples: int,
-    num_features: int,
 ):
-    """Run the regular, everyday image LIME baseline and keep its usual display."""
+    """Run the regular, everyday image LIME baseline."""
     explainer = lime_image.LimeImageExplainer(random_state=42)
     explanation = explainer.explain_instance(
         image,
@@ -361,21 +360,9 @@ def standard_lime(
         if 0 <= segment_id < len(segment_weights):
             segment_weights[segment_id] = weight
 
-    temp, mask = explanation.get_image_and_mask(
-        target_class,
-        positive_only=True,
-        num_features=num_features,
-        hide_rest=False,
-    )
-    temp = np.asarray(temp)
-    if temp.max() > 1.0:
-        temp = temp / 255.0
-    display_image = mark_boundaries(temp, mask, color=(0, 1, 0), mode="inner")
-
     return {
         "segments": segments,
         "segment_weights": segment_weights,
-        "display_image": display_image,
         "score": explanation.score,
         "target_class": target_class,
         "perturbation": "standard",
@@ -414,6 +401,30 @@ def build_signed_maps(
     return positive_map, negative_map
 
 
+def build_signed_rgba_overlays(
+    segments: np.ndarray,
+    segment_weights: np.ndarray,
+    num_features: int,
+    max_alpha: float = 0.55,
+):
+    """Create green/red overlays with transparent non-selected pixels."""
+    positive_map, negative_map = build_signed_maps(
+        segments,
+        segment_weights,
+        num_features=num_features,
+    )
+
+    green_overlay = np.zeros((*positive_map.shape, 4), dtype=np.float32)
+    green_overlay[..., 1] = 1.0
+    green_overlay[..., 3] = max_alpha * positive_map
+
+    red_overlay = np.zeros((*negative_map.shape, 4), dtype=np.float32)
+    red_overlay[..., 0] = 1.0
+    red_overlay[..., 3] = max_alpha * negative_map
+
+    return green_overlay, red_overlay
+
+
 def plot_four_way(
     image: np.ndarray,
     results: list[dict],
@@ -423,17 +434,14 @@ def plot_four_way(
     fig, axes = plt.subplots(2, 2, figsize=(12, 11))
     axes = axes.flatten()
     for ax, result in zip(axes, results):
-        if "display_image" in result:
-            ax.imshow(result["display_image"])
-        else:
-            pos_map, neg_map = build_signed_maps(
-                result["segments"],
-                result["segment_weights"],
-                num_features=num_features,
-            )
-            ax.imshow(image)
-            ax.imshow(pos_map, cmap="Greens", alpha=0.55)
-            ax.imshow(neg_map, cmap="Reds", alpha=0.55)
+        green_overlay, red_overlay = build_signed_rgba_overlays(
+            result["segments"],
+            result["segment_weights"],
+            num_features=num_features,
+        )
+        ax.imshow(image)
+        ax.imshow(green_overlay)
+        ax.imshow(red_overlay)
         ax.set_title(result["name"])
         ax.axis("off")
 
@@ -485,7 +493,6 @@ def main() -> None:
         predict_fn,
         target_class,
         args.num_samples,
-        args.num_features,
     )
     result["name"] = "1. Standard LIME"
     results.append(result)
